@@ -10,7 +10,9 @@
   intermediates/旧/新中间 CA 证书
   replicas/     每个副本的旧链、新链（叶子 + 中间，PEM 拼接）
   bundles/      终端旧根包、新根包、并集过渡包
-  sample.json   页面表单预填数据
+  revocation/   吊销核查样例：颁发 CA、两张递进编号的 CRL、同名换钥 CA 及其 CRL
+  sample.json   换证顺序规划页表单预填数据
+  revocation-sample.json  吊销核查页表单预填数据
 
 样例只用于本地演示：私钥同样落盘，但全部为本地临时测试用途。
 """
@@ -177,6 +179,41 @@ def make_leaf(
     return cert
 
 
+def _pem_crl(crl: x509.CertificateRevocationList) -> str:
+    return crl.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+
+def make_crl(
+    number: int,
+    revoked_serials: list[int],
+    issuer_cert: x509.Certificate,
+    issuer_key: rsa.RSAPrivateKey,
+) -> x509.CertificateRevocationList:
+    """签发一张完整 CRL（带 CRL 编号，有效期 提前 1 小时 ~ 30 天后）。"""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    builder = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(issuer_cert.subject)
+        .last_update(now - datetime.timedelta(hours=1))
+        .next_update(now + datetime.timedelta(days=30))
+        .add_extension(x509.CRLNumber(number), critical=False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                issuer_key.public_key()
+            ),
+            critical=False,
+        )
+    )
+    for serial in revoked_serials:
+        builder = builder.add_revoked_certificate(
+            x509.RevokedCertificateBuilder()
+            .serial_number(serial)
+            .revocation_date(now - datetime.timedelta(days=1))
+            .build()
+        )
+    return builder.sign(issuer_key, hashes.SHA256())
+
+
 def generate(out_dir: str | os.PathLike = "samples") -> pathlib.Path:
     out = pathlib.Path(out_dir)
 
@@ -202,9 +239,13 @@ def generate(out_dir: str | os.PathLike = "samples") -> pathlib.Path:
     _save(out / "bundles" / "union-bundle.pem", union_bundle)
 
     sample = {"replicas": [], "batches": [], "max_transition": 3}
+    old_leaves: dict[str, x509.Certificate] = {}
+    new_leaves: dict[str, x509.Certificate] = {}
     for idx, (label, domain) in enumerate(REPLICA_DOMAINS, start=1):
         old_leaf = make_leaf(domain, [domain], old_int, old_int_key)
         new_leaf = make_leaf(domain, [domain], new_int, new_int_key)
+        old_leaves[label] = old_leaf
+        new_leaves[label] = new_leaf
         old_chain = _pem_cert(old_leaf) + _pem_cert(old_int)
         new_chain = _pem_cert(new_leaf) + _pem_cert(new_int)
         _save(out / "replicas" / label / "old-chain.pem", old_chain)
@@ -230,6 +271,67 @@ def generate(out_dir: str | os.PathLike = "samples") -> pathlib.Path:
 
     meta_path = out / "sample.json"
     meta_path.write_text(json.dumps(sample, ensure_ascii=False, indent=2), "utf-8")
+
+    # ---------------- 吊销核查样例 ----------------
+    # 新中间 CA 的两张递进清单：#1 吊销 svc-b，#2 再吊销 svc-c（演示清单更新）
+    crl1 = make_crl(1, [new_leaves["svc-b"].serial_number], new_int, new_int_key)
+    crl2 = make_crl(
+        2,
+        [new_leaves["svc-b"].serial_number, new_leaves["svc-c"].serial_number],
+        new_int,
+        new_int_key,
+    )
+    # 同名换钥 CA：与新中间 CA 同名但密钥不同，演示按「CA 名称+公钥」分别保存
+    rotated_int, rotated_int_key = make_intermediate(
+        "Demo New Intermediate CA", new_root, new_root_key
+    )
+    rotated_crl1 = make_crl(1, [], rotated_int, rotated_int_key)
+
+    revo_dir = out / "revocation"
+    _save(revo_dir / "issuer-ca.pem", _pem_cert(new_int))
+    _save(revo_dir / "crl-1.pem", _pem_crl(crl1))
+    _save(revo_dir / "crl-2.pem", _pem_crl(crl2))
+    _save(revo_dir / "rotated-issuer-ca.pem", _pem_cert(rotated_int))
+    _save(revo_dir / "rotated-issuer-crl-1.pem", _pem_crl(rotated_crl1))
+
+    revo_sample = {
+        "replicas": [
+            # svc-a-old 的颁发 CA（旧中间 CA）没有对应清单，核查时恒为“待核实”
+            {
+                "name": label,
+                "leaf_pem": _pem_cert(new_leaves[label]),
+                "issuer_pem": _pem_cert(new_int),
+            }
+            for label, _ in REPLICA_DOMAINS
+        ]
+        + [
+            {
+                "name": "svc-a-old",
+                "leaf_pem": _pem_cert(old_leaves["svc-a"]),
+                "issuer_pem": _pem_cert(old_int),
+            }
+        ],
+        "crls": [
+            {
+                "label": "清单 #1（吊销 svc-b）",
+                "ca_pem": _pem_cert(new_int),
+                "crl_pem": _pem_crl(crl1),
+            },
+            {
+                "label": "清单 #2（吊销 svc-b、svc-c）",
+                "ca_pem": _pem_cert(new_int),
+                "crl_pem": _pem_crl(crl2),
+            },
+        ],
+        "rotated": {
+            "label": "同名换钥 CA 的清单 #1（空清单）",
+            "ca_pem": _pem_cert(rotated_int),
+            "crl_pem": _pem_crl(rotated_crl1),
+        },
+    }
+    (out / "revocation-sample.json").write_text(
+        json.dumps(revo_sample, ensure_ascii=False, indent=2), "utf-8"
+    )
     return meta_path
 
 

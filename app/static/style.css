@@ -127,3 +127,25 @@ table.matrix .rh { text-align: left; background: #eef2fb; }
 .cell { display: inline-block; width: 20px; font-weight: 700; }
 .cell.ok { color: var(--green); }
 .cell.bad { color: var(--red); }
+
+/* 顶部导航 */
+.topnav { margin-bottom: 14px; font-size: 13px; }
+.topnav a {
+  color: rgba(255,255,255,.85); text-decoration: none;
+  padding: 4px 12px; border-radius: 999px; margin-right: 6px;
+  border: 1px solid rgba(255,255,255,.35);
+}
+.topnav a:hover { color: #fff; border-color: #fff; }
+.topnav a.active { background: rgba(255,255,255,.18); color: #fff; font-weight: 700; }
+
+/* 吊销核查 */
+.badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+.badge.revoked { background: var(--red-bg); color: var(--red); }
+.badge.clear { background: var(--green-bg); color: var(--green); }
+.badge.pending { background: var(--amber-bg); color: var(--amber); }
+.mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; }
+.sample-crls { margin: 4px 0 12px; font-size: 13px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.upload-msg { font-size: 13px; }
+.upload-msg.ok-text { color: var(--green); }
+.upload-msg.bad-text { color: var(--red); }
+.subhead { margin: 18px 0 8px; font-size: 14px; }

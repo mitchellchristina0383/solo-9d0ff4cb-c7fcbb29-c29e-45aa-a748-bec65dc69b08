@@ -3,4 +3,5 @@ __pycache__/
 .pytest_cache/
 .venv/
 samples_test/
+data/
 .DS_Store

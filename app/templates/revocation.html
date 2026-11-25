@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>吊销核查 · 内网 HTTPS 证书工具</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <nav class="topnav">
+    <a href="/">换证顺序规划</a>
+    <a href="/revocation" class="active">吊销核查</a>
+  </nav>
+  <h1>吊销清单核查</h1>
+  <p class="subtitle">
+    内网 CA 发来吊销清单（CRL）后，录入各副本的叶子证书与直接颁发 CA 证书，
+    逐副本判定 已吊销 / 未列入 / 待核实。清单按「CA 名称＋公钥」保存最新一版，
+    重启后保留；每轮核查固定开始时的清单与核验时刻，核查期间仍可上传新清单。
+  </p>
+</header>
+
+<main>
+  <section class="card">
+    <div class="card-head">
+      <h2>1. 服务副本（最多 8 个，每个填叶子证书与直接颁发 CA 证书）</h2>
+      <button type="button" class="btn ghost" id="loadSample">载入吊销核查样例</button>
+    </div>
+    <div id="replicas"></div>
+    <button type="button" class="btn small" id="addReplica">＋ 添加副本</button>
+  </section>
+
+  <section class="card">
+    <h2>2. 上传吊销清单（PEM CRL，须附颁发 CA 证书）</h2>
+    <p class="hint">
+      只收覆盖该 CA 全部直签证书的完整清单；上传时核对颁发者、签名、编号与有效期。
+      编号低于现行、或同号但内容不同的上传会被拒绝并保留现行清单；同号同内容可重传。
+    </p>
+    <div id="sampleCrls" class="sample-crls"></div>
+    <div class="pem-grid">
+      <div>
+        <div class="pem-label">颁发 CA 证书 PEM（1 张 CA 证书）</div>
+        <textarea id="caPem" class="pem" rows="7" spellcheck="false"></textarea>
+        <div class="pem-summary" id="caSummary"></div>
+      </div>
+      <div>
+        <div class="pem-label">吊销清单 PEM（-----BEGIN X509 CRL-----）</div>
+        <textarea id="crlPem" class="pem" rows="7" spellcheck="false"></textarea>
+        <div class="pem-summary" id="crlSummary"></div>
+      </div>
+    </div>
+    <div class="actions">
+      <button type="button" class="btn primary" id="uploadBtn">上传清单</button>
+      <span id="uploadMsg" class="upload-msg"></span>
+    </div>
+    <h3 class="subhead">已保存清单（按 CA 名称＋公钥，重启后保留）</h3>
+    <div id="crlList"><p class="hint">暂无已保存清单。</p></div>
+  </section>
+
+  <section class="card">
+    <h2>3. 开始核查</h2>
+    <div class="actions">
+      <button type="button" class="btn primary" id="checkBtn">开始核查</button>
+      <span id="formError" class="error"></span>
+    </div>
+    <div id="checkResult"></div>
+  </section>
+</main>
+
+<template id="replicaTpl">
+  <div class="entity" data-role="replica">
+    <div class="entity-head">
+      <span class="entity-title">副本 <span class="idx"></span></span>
+      <label>名称 <input type="text" class="name" placeholder="svc-a"></label>
+      <button type="button" class="btn small danger remove">删除</button>
+    </div>
+    <div class="pem-grid">
+      <div>
+        <div class="pem-label">叶子证书 PEM</div>
+        <textarea class="leaf_pem pem" rows="6" spellcheck="false"></textarea>
+        <div class="pem-summary" data-for="leaf_pem"></div>
+      </div>
+      <div>
+        <div class="pem-label">直接颁发 CA 证书 PEM</div>
+        <textarea class="issuer_pem pem" rows="6" spellcheck="false"></textarea>
+        <div class="pem-summary" data-for="issuer_pem"></div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script>
+const STATUS_LABELS = {{ status_labels | tojson }};
+const SAMPLE = {{ sample | tojson }};
+const MAX_ROWS = 8;
+
+const replicasEl = document.getElementById('replicas');
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renumber() {
+  [...replicasEl.children].forEach((el, i) => {
+    el.querySelector('.idx').textContent = i + 1;
+    el.querySelector('.remove').disabled = replicasEl.children.length <= 1;
+  });
+}
+
+function addRow(data) {
+  if (replicasEl.children.length >= MAX_ROWS) return;
+  const tpl = document.getElementById('replicaTpl');
+  const node = tpl.content.firstElementChild.cloneNode(true);
+  replicasEl.appendChild(node);
+  node.querySelector('.remove').addEventListener('click', () => {
+    node.remove();
+    renumber();
+  });
+  if (data) {
+    node.querySelector('.name').value = data.name || '';
+    node.querySelector('.leaf_pem').value = data.leaf_pem || '';
+    node.querySelector('.issuer_pem').value = data.issuer_pem || '';
+    [...node.querySelectorAll('textarea.pem')].forEach(refreshSummary);
+  }
+  renumber();
+}
+
+async function postSummary(kind, pem) {
+  const resp = await fetch('/api/summaries', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({kind, pem})
+  });
+  return await resp.json();
+}
+
+async function refreshSummary(textarea) {
+  const pem = textarea.value.trim();
+  const summaryEl = textarea.parentElement.querySelector('.pem-summary');
+  if (!pem) { summaryEl.textContent = ''; summaryEl.className = 'pem-summary'; return; }
+  const kind = textarea.classList.contains('leaf_pem') ? 'chain' : 'bundle';
+  const data = await postSummary(kind, pem);
+  if (data.ok) {
+    const s = data.summary;
+    summaryEl.className = 'pem-summary ok';
+    if (kind === 'chain') {
+      summaryEl.textContent = `✓ 叶子 CN=${s.common_name || '-'}；序列号 ${s.serial}；`
+        + `有效期至 ${s.not_valid_after}`;
+    } else {
+      summaryEl.textContent = `✓ CA 证书：${s.subjects.join(' | ')}`;
+    }
+  } else {
+    summaryEl.className = 'pem-summary bad';
+    summaryEl.textContent = '✗ ' + data.error;
+  }
+}
+
+document.getElementById('replicas').addEventListener('focusout', (ev) => {
+  if (ev.target.matches('textarea.pem')) refreshSummary(ev.target);
+});
+
+document.getElementById('addReplica').addEventListener('click', () => addRow());
+
+// ---------------- 上传清单 ----------------
+const caPemEl = document.getElementById('caPem');
+const crlPemEl = document.getElementById('crlPem');
+
+caPemEl.addEventListener('focusout', async () => {
+  const el = document.getElementById('caSummary');
+  const pem = caPemEl.value.trim();
+  if (!pem) { el.textContent = ''; el.className = 'pem-summary'; return; }
+  const data = await postSummary('bundle', pem);
+  el.className = 'pem-summary ' + (data.ok ? 'ok' : 'bad');
+  el.textContent = data.ok ? `✓ CA 证书：${data.summary.subjects.join(' | ')}` : '✗ ' + data.error;
+});
+
+crlPemEl.addEventListener('focusout', async () => {
+  const el = document.getElementById('crlSummary');
+  const pem = crlPemEl.value.trim();
+  if (!pem) { el.textContent = ''; el.className = 'pem-summary'; return; }
+  const data = await postSummary('crl', pem);
+  el.className = 'pem-summary ' + (data.ok ? 'ok' : 'bad');
+  if (data.ok) {
+    const s = data.summary;
+    el.textContent = `✓ 颁发者 ${s.issuer}；编号 ${s.crl_number ?? '（缺失）'}；`
+      + `条目 ${s.revoked_count}；nextUpdate ${s.next_update || '（缺失）'}`
+      + (s.is_delta ? '；⚠ 增量清单' : '');
+  } else {
+    el.textContent = '✗ ' + data.error;
+  }
+});
+
+async function refreshCrlList() {
+  const box = document.getElementById('crlList');
+  const resp = await fetch('/api/crls');
+  const data = await resp.json();
+  if (!data.ok || !data.crls.length) {
+    box.innerHTML = '<p class="hint">暂无已保存清单。</p>';
+    return;
+  }
+  box.innerHTML = `<table class="diag"><thead><tr>
+    <th>CA 名称</th><th>公钥指纹</th><th>清单编号</th><th>吊销条目</th>
+    <th>thisUpdate</th><th>nextUpdate</th><th>保存时间</th></tr></thead>
+    <tbody>${data.crls.map(c => `<tr>
+      <td>${esc(c.ca_name)}</td>
+      <td class="mono">${esc(c.key_fingerprint_short)}…</td>
+      <td><strong>${c.crl_number}</strong></td>
+      <td>${c.revoked_count}</td>
+      <td>${esc(c.this_update)}</td><td>${esc(c.next_update)}</td>
+      <td>${esc(c.stored_at)}</td></tr>`).join('')}</tbody></table>`;
+}
+
+document.getElementById('uploadBtn').addEventListener('click', async () => {
+  const msg = document.getElementById('uploadMsg');
+  msg.textContent = '';
+  msg.className = 'upload-msg';
+  const btn = document.getElementById('uploadBtn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/crl/upload', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ca_pem: caPemEl.value, crl_pem: crlPemEl.value})
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      msg.classList.add('ok-text');
+      msg.textContent = `✓ ${data.message}`;
+    } else {
+      msg.classList.add('bad-text');
+      msg.textContent = `✗ ${data.error}`;
+    }
+    refreshCrlList();
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ---------------- 样例 ----------------
+document.getElementById('loadSample').addEventListener('click', () => {
+  if (!SAMPLE) { alert('样例文件不存在（samples/revocation-sample.json）'); return; }
+  replicasEl.innerHTML = '';
+  SAMPLE.replicas.forEach(r => addRow(r));
+});
+
+function renderSampleCrls() {
+  const box = document.getElementById('sampleCrls');
+  if (!SAMPLE) return;
+  const entries = [...(SAMPLE.crls || [])];
+  if (SAMPLE.rotated) entries.push(SAMPLE.rotated);
+  if (!entries.length) return;
+  box.innerHTML = '样例清单：' + entries.map((c, i) =>
+    `<button type="button" class="btn small" data-idx="${i}">${esc(c.label)}</button>`
+  ).join(' ');
+  box.querySelectorAll('button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const entry = entries[parseInt(btn.dataset.idx, 10)];
+      caPemEl.value = entry.ca_pem;
+      crlPemEl.value = entry.crl_pem;
+      caPemEl.dispatchEvent(new Event('focusout'));
+      crlPemEl.dispatchEvent(new Event('focusout'));
+    });
+  });
+}
+
+// ---------------- 核查 ----------------
+function collect() {
+  return {
+    replicas: [...replicasEl.children].map(node => ({
+      name: node.querySelector('.name').value.trim(),
+      leaf_pem: node.querySelector('.leaf_pem').value,
+      issuer_pem: node.querySelector('.issuer_pem').value,
+    }))
+  };
+}
+
+const STATUS_CLASS = {revoked: 'revoked', not_listed: 'clear', pending: 'pending'};
+
+function renderCheck(data) {
+  const rows = data.results.map(r => {
+    const badge = `<span class="badge ${STATUS_CLASS[r.status]}">${esc(STATUS_LABELS[r.status])}</span>`;
+    const crl = r.crl_number !== null ? `#${r.crl_number}` : '—';
+    let detail = '';
+    if (r.status === 'revoked') detail = `吊销时间 ${esc(r.revoked_at)}`;
+    else if (r.status === 'not_listed') detail = '序列号未列入清单';
+    else detail = esc(r.reason);
+    return `<tr>
+      <td>${esc(r.name)}</td>
+      <td>${badge}</td>
+      <td>${crl}</td>
+      <td class="mono">${esc((r.leaf_serial || '').slice(0, 16))}…</td>
+      <td>${detail}</td></tr>`;
+  }).join('');
+  return `<div class="banner ok">本轮核验时刻：<strong>${esc(data.checked_at)}</strong>
+    （清单集合在核查开始即固定，期间新上传的清单不影响本轮结果）</div>
+    <table class="diag"><thead><tr>
+      <th>副本</th><th>结论</th><th>所用清单编号</th><th>叶子序列号</th><th>说明</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+document.getElementById('checkBtn').addEventListener('click', async () => {
+  const errEl = document.getElementById('formError');
+  errEl.textContent = '';
+  const btn = document.getElementById('checkBtn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/crl/check', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(collect())
+    });
+    const data = await resp.json();
+    const box = document.getElementById('checkResult');
+    if (!data.ok) {
+      box.innerHTML = `<div class="banner bad"><strong>输入有误：</strong>${esc(data.error)}</div>`;
+      return;
+    }
+    box.innerHTML = renderCheck(data);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// 初始一行空表单；有样例时自动载入；加载已保存清单
+addRow();
+if (SAMPLE) document.getElementById('loadSample').click();
+renderSampleCrls();
+refreshCrlList();
+</script>
+</body>
+</html>

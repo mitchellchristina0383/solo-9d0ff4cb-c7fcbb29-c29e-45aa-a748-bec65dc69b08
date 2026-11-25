@@ -7,6 +7,10 @@ services:
       - "8000:8000"
     environment:
       PORT: "8000"
+      CRL_DATA_DIR: /app/data/crls
+    volumes:
+      # 吊销清单持久化：容器重启/重建后已保存清单仍保留
+      - crl-data:/app/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/sample', timeout=5)"]
@@ -14,3 +18,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  crl-data:
